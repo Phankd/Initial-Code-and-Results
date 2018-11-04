@@ -1,0 +1,179 @@
+---
+output:
+  word_document: default
+  html_document: default
+---
+```{r}
+library(plyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(usdm)
+library(corrplot)
+library(Hmisc)
+library(FSelector)
+library(ROSE)
+library(caret)
+library(pROC)
+library(class) 
+library(descr)
+library(nortest)
+```
+
+
+```{r}
+setwd("C:/Users/Kevin.Phan/Desktop/Capstone")
+DF1 <- read.csv("DSI_kickstarterscrape_dataset.csv")
+DF2 <- read.csv("MasterKickstarter.csv")
+DF3 <- read.csv("ks-projects-201612.csv")
+DF4 <- read.csv("18k_Projects.csv")
+```
+
+
+```{r}
+#DATA CLEANSING***
+#Merging datasets based on left join. 
+DF3 <- DF3[,c(1,8)]
+master_data <- join(DF1,DF2, by = "ID", type = "left")
+master_data <- join(master_data,DF3, by = "ID", type = "left")
+master_data <- master_data[complete.cases(master_data),]
+master_data <- master_data[,unique(names(master_data))]
+duplicated(colnames(master_data))
+str(master_data) #check for variable types. Change where meeded. 
+master_data$Deadline <- as.Date(as.character(master_data$Deadline),"%m/%d/%y")
+master_data$Launched <- substr(master_data$Launched,1,10)
+master_data$Launched <- as.Date(as.character(master_data$Launched),"%Y-%m-%d")
+master_data$Created_At <- as.Date(as.character(master_data$Created_At),"%m/%d/%y")
+master_data <- master_data[,c(1:16,24,17:23)]
+master_data$Name <- as.character(master_data$Name)
+master_data <- master_data[master_data$Status != "live",]
+master_data <- master_data[master_data$Status != "canceled",]
+master_data$Status <- factor(master_data$Status)#We will not deal with live and cancelled in this analysis.
+```
+
+```{r}
+numericAtt <- vector("numeric",10L)
+for (i in 1:ncol(master_data)) {
+  if (class(master_data[,i]) == "numeric" || class(master_data[,i]) == "integer" ){numericAtt[i] = i}
+  else {numericAtt[i] = NA}
+}
+numericAtt <- numericAtt[!is.na(numericAtt)][-1]
+```
+
+
+```{r}
+#We will now visualize imbalanaces in Status and see Category Frequencies
+ggplot(data.frame(master_data$Status),aes(x=master_data$Status)) + geom_bar()
+ggplot(data.frame(master_data$Main.Category),aes(x=master_data$Main.Category)) + geom_bar()
+#We see there is way more successful then failed. and category of music is alot more than others. We will fix this in the next step
+#There are few major outliers that we can afford to remove. We will use mahalanobis distance.Multivariate
+```
+
+
+```{r}
+MD <- mahalanobis(master_data[,c(numericAtt)], colMeans(master_data[,c(numericAtt)]),cov(master_data[,c(numericAtt)]),tol=1e-20)
+master_data$MD <- round(MD,3)
+master_data$Outlier_Mahalanobis <- "No"
+master_data$Outlier_Mahalanobis[master_data$MD > 12] <- "Yes" #Threshold i did chose was 9. 
+master_data <- master_data[master_data$Outlier_Mahalanobis == "No",]
+attach(master_data)
+```
+
+
+```{r}
+boxplot(master_data[numericAtt], xlab = "Numeric Attributes", ylab = "Count", main = "Boxplots of All Numeric Attributes")
+grid(20,20, col = "lightgray", lty = "dotted",lwd = par("lwd"), equilogs = TRUE) #population has outliers does it matter 
+Correlations <- cor(master_data[,numericAtt])
+corrplot(Correlations) #We see there are a few highly correlated variables. We will use feature selection. 
+```
+
+
+```{r}
+#Remove NA
+#Dealing with imbalance 
+table(master_data$Status)
+Balanced_Data <- ovun.sample(Status ~ ., data = master_data, method = "both",p = 0.5)$data #Utilizes both over and under sampling. ** DEBUG ROSE**
+table(Balanced_Data$Status)
+#Removing Collinear variables
+vifselection <- vif(master_data[,numericAtt])
+```
+
+```{r}
+#Test for nomality
+lapply(Balanced_Data[,numericAtt], ad.test) #Anderson Darling Test
+lapply(Balanced_Data[1:5000,numericAtt], shapiro.test) # Shapiro-Wilk Test 
+#Both tests have p values under 0.05. Therefore, we can reject the null hypothesis of normality. 
+```
+
+```{r}
+#further Feature Selection via information gain
+weights <- information.gain(Status~., master_data[,numericAtt])
+print(weights)
+subset <- cutoff.k(weights, 4) #mean is 0.13
+f <- as.simple.formula(subset, "Status")
+print(f)
+
+#Feature PCA
+PCA <- prcomp(master_data[,numericAtt], scale = FALSE, center= FALSE)
+plot(PCA, type = "l", main = 'without data normalization')
+#Seems only one principal component is all it needs. Better to go with info gain with all the vairables above the average value. 
+```
+
+```{r}
+#Logistic Regression using cross fold for partitioning
+#Created a new dataset for the logisitc regression. I created a loop to test the model under different amounts of trianing data folds. 
+Balanced_DataLOG <- Balanced_Data %>% mutate_if(is.numeric, scale) #Scaling Balanced Data Set
+Balanced_DataLOG<-Balanced_DataLOG[sample(nrow(Balanced_DataLOG)),]
+folds <- cut(seq(1,nrow(Balanced_DataLOG)),breaks=100,labels=FALSE)
+AUCValue <- vector("numeric",10L)
+#Perform 10 fold cross validation on our first model: Logistic Regression
+for(i in 1:30){
+  #Segement your data by fold using the which() function 
+  testIndexes <- which(folds==i,arr.ind=TRUE)
+  testData <- Balanced_DataLOG[testIndexes, ]
+  trainData <- Balanced_DataLOG[-testIndexes, ]
+  Mod <- glm(Status ~  Pledged + Backers + Updates + Comments, family = "binomial", data = trainData)
+  pred <- predict(Mod,testData, type = "response")
+  RocVal <- roc(testData$Status,pred)
+  AUCValue[i] <- auc(RocVal)
+}
+AUCValue
+KFolds <- c(1:30)
+scatter.smooth(KFolds,AUCValue, col = c("Blue","red")) #We seethe same pattern. I say about 4 folds is optimal.
+```
+
+```{r}
+#Logistic Regression using optimal Percentage Split
+set.seed(100)
+smp_size <- floor(0.75 * nrow(Balanced_Data))
+train_ind <- sample(seq_len(nrow(Balanced_DataLOG)), size = smp_size)
+train <- Balanced_DataLOG[train_ind, ]
+test <- Balanced_DataLOG[-train_ind, ]
+Mod <- glm(Status ~ Pledged + Backers + Updates + Comments + Pledge_per_person, family = "binomial", data = train)
+predPercSplit <- predict(Mod,test, type = "response")
+auc(roc(test$Status,predPercSplit)) #0.922 roc and auc give different auc vals?
+#14 fold cv is better and so we will use this. 
+```
+
+```{r}
+#KNN
+#___________________________________________________________________________
+#Standardize
+Balanced_DataKNN <- Balanced_Data %>% mutate_if(is.numeric, scale)
+Balanced_DataKNN <- Balanced_Data[,c(5,numericAtt)]
+Balanced_DataKNN$Status <- as.numeric(Balanced_DataKNN$Status) #converted successful and failed to 1 and 2
+Balanced_DataKNN <- Balanced_DataKNN[sample(1:nrow(Balanced_Data)), ]
+
+for (i in seq(.1,1,.1)) {
+
+  index = createDataPartition(Balanced_DataKNN$Status, p = i, list = F )
+  train = Balanced_DataKNN[index,]
+  test = Balanced_DataKNN[-index,]
+  Balanced_Train_labels <- Balanced_DataKNN[1:nrow(train),1]
+  Balanced_Test_labels <- Balanced_DataKNN[(nrow(train)+1):nrow(Balanced_DataKNN),1]
+  
+  KnnPredictions <- knn(train = train, test = test,cl = Balanced_Train_labels, k=10)
+
+}
+```
+
