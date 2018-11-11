@@ -1,0 +1,239 @@
+---
+output:
+  word_document: default
+  html_document: default
+---
+```{r}
+library(plyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(usdm)
+library(corrplot)
+library(Hmisc)
+library(FSelector)
+library(ROSE)
+library(caret)
+library(pROC)
+library(class) 
+library(descr)
+library(nortest)
+library(magrittr)
+```
+
+
+```{r}
+setwd("C:/Users/Kevin.Phan/Desktop/Capstone")
+DF1 <- read.csv("DSI_kickstarterscrape_dataset.csv")
+DF2 <- read.csv("MasterKickstarter.csv")
+DF3 <- read.csv("ks-projects-201612.csv")
+DF4 <- read.csv("18k_Projects.csv")
+```
+
+
+```{r}
+#DATA CLEANSING***
+DF3 <- DF3[,c(1,8)]
+master_data <- join(DF1,DF2, by = "ID", type = "left")
+master_data <- join(master_data,DF3, by = "ID", type = "left")
+master_data <- master_data[complete.cases(master_data),]
+master_data <- master_data[,unique(names(master_data))]
+duplicated(colnames(master_data))
+str(master_data) #check for variable types. Change where meeded. 
+master_data$Deadline <- as.Date(as.character(master_data$Deadline),"%m/%d/%y")
+master_data$Launched <- substr(master_data$Launched,1,10)
+master_data$Launched <- as.Date(as.character(master_data$Launched),"%Y-%m-%d")
+master_data$Created_At <- as.Date(as.character(master_data$Created_At),"%m/%d/%y")
+master_data <- master_data[,c(1:16,24,17:23)]
+master_data$Name <- as.character(master_data$Name)
+master_data <- master_data[master_data$Status != "live",]
+master_data <- master_data[master_data$Status != "canceled",]
+master_data$Status <- factor(master_data$Status)#We will not deal with live and cancelled in this analysis.
+```
+
+```{r}
+#Creating a vector with just the numeric attributes column numbers. This way we can easily reference for them when using alogrithms that can only take numeric attirubtes such as PCA and mahalanobis. 
+numericAtt <- vector("numeric",10L)
+for (i in 1:ncol(master_data)) {
+  if (class(master_data[,i]) == "numeric" || class(master_data[,i]) == "integer" ){numericAtt[i] = i}
+  else {numericAtt[i] = NA}
+}
+numericAtt <- numericAtt[!is.na(numericAtt)][-1]
+```
+
+
+```{r}
+#We will now visualize imbalanaces in Status and see Category Frequencies
+ggplot(data.frame(master_data$Status),aes(x=master_data$Status)) + geom_bar()
+ggplot(data.frame(master_data$Main.Category),aes(x=master_data$Main.Category)) + geom_bar()
+#We see there is way more successful then failed. and category of music is alot more than others. We will fix this in the next step
+#There are few major outliers that we can afford to remove. We will use mahalanobis distance.Multivariate
+```
+
+
+```{r}
+#Remove the outliers in the data using mahalanobis distance. 
+MD <- mahalanobis(master_data[,c(numericAtt)], colMeans(master_data[,c(numericAtt)]),cov(master_data[,c(numericAtt)]),tol=1e-20)
+master_data$MD <- round(MD,3)
+master_data$Outlier_Mahalanobis <- "No"
+master_data$Outlier_Mahalanobis[master_data$MD > 12] <- "Yes" #Threshold i did chose was 9. 
+master_data <- master_data[master_data$Outlier_Mahalanobis == "No",]
+attach(master_data)
+```
+
+
+```{r}
+#visualizing correlations. 
+boxplot(master_data[numericAtt], xlab = "Numeric Attributes", ylab = "Count", main = "Boxplots of All Numeric Attributes")
+grid(20,20, col = "lightgray", lty = "dotted",lwd = par("lwd"), equilogs = TRUE) 
+#population has outliers does it matter 
+Correlations <- cor(master_data[,numericAtt])
+corrplot(Correlations) 
+#We see there are a few highly correlated variables. We will use feature selection. 
+```
+
+
+```{r}
+#Remove NA
+#Dealing with imbalance 
+table(master_data$Status)
+Balanced_Data <- ovun.sample(Status ~ ., data = master_data, method = "both",p = 0.5)$data #Utilizes both over and under sampling. ** DEBUG ROSE**
+table(Balanced_Data$Status)
+```
+
+```{r}
+#Test for nomality
+lapply(Balanced_Data[,numericAtt], ad.test) #Anderson Darling Test
+lapply(Balanced_Data[1:5000,numericAtt], shapiro.test) # Shapiro-Wilk Test 
+#Both tests have p values under 0.05. Therefore, we can reject the null hypothesis of normality. 
+```
+
+```{r}
+#now that we have processed the data, removed worthy outliers, dealth with imbalanace, tested for normality and saw visually what our data is like, we can go ahead and perform feature selection and extraction via information 
+
+#Feature Selection via information gain
+weights <- information.gain(Status~., master_data[,numericAtt])
+print(weights)
+subset <- cutoff.k(weights, 4) #mean is 0.13
+f <- as.simple.formula(subset, "Status")
+print(f)
+#Info gain gave us four features. 
+```
+
+
+```{r}
+#PCA - Since we cannot do PCA on the entire dataset at once (due to exposing the test set), we will use a 70/30 split and perform PCA on the training set. Once we obtain our principal components, we will run a logisitc regression with it in the next step. 
+ScaledData <- as.data.frame(scale(Balanced_Data[,numericAtt]))
+smp_size <- floor(0.75 * nrow(ScaledData))
+train_ind <- sample(seq_len(nrow(ScaledData)), size = smp_size)
+TRAINPCA <- ScaledData[train_ind, ]
+TESTPCA <- ScaledData[-train_ind, ]
+PCATRAIN <- prcomp(TRAINPCA, scale = FALSE, center= FALSE)
+LoadingMatrix <- PCATRAIN$rotation
+dim(PCATRAIN$x) #has principal component score vectors in a 8336 x 12 matrix.
+biplot(PCATRAIN, scale = 0)
+PCAstd_dev <- PCATRAIN$sdev
+PCA_var <- PCAstd_dev^2
+#proportion of variance explained
+varianceexplained <- PCA_var/sum(PCA_var)
+plot(varianceexplained, type = "b", main = 'Components With Standardization')
+plot(cumsum(varianceexplained), xlab = "Components", ylab = "Variance Explained")
+#We see that the first 11 principal components explained around 95% of the variance in the data. We will go with that. 
+```
+
+
+
+
+
+
+
+
+```{r}
+
+#Now that we have done PCA and information gain, we will test the logisitc regression agains the features determined by the information gain as well as the principal components. We will use each.  
+
+
+#Created a new dataset for the logisitc regression. I created a loop to test the model under different amounts of trianing data folds. 
+Balanced_DataLOG <- Balanced_Data %>% mutate_if(is.numeric, scale) #Scaling Balanced Data Set
+Balanced_DataLOG<-Balanced_DataLOG[sample(nrow(Balanced_DataLOG)),]
+folds <- cut(seq(1,nrow(Balanced_DataLOG)),breaks=100,labels=FALSE)
+AUCValue <- vector("numeric",10L)
+#Perform 10 fold cross validation on our first model: Logistic Regression
+for(i in 1:30){
+  testIndexes <- which(folds==i,arr.ind=TRUE)
+  TESTLOGI <- Balanced_DataLOG[testIndexes, ]
+  TRAINLOGI <- Balanced_DataLOG[-testIndexes, ]
+  Mod <- glm(Status ~  Pledged + Backers + Updates + Comments, family = "binomial", data = TRAINLOGI)
+  pred <- predict(Mod,TESTLOGI, type = "response")
+  RocVal <- roc(TESTLOGI$Status,pred)
+  AUCValue[i] <- auc(RocVal)
+}
+AUCValue
+KFolds <- c(1:30)
+scatter.smooth(KFolds,AUCValue, col = c("Blue","red")) #We see the same pattern. I say about 21 folds is optimal.v AUC = 0.9529070
+```
+```{r}
+
+#We will now perform the same method but with 11 principal components
+
+#we are interested in first 11 PCs
+TRAINPCA <- merge(TRAINPCA,Balanced_Data$Status, by = 0)
+colnames(TRAINPCA)[14] <- "Status"
+TRAINPCA[1] = NULL
+train.data.PCA <- data.frame(Status = TRAINPCA$Status, PCATRAIN$x)
+train.data.PCA <- train.data.PCA[,1:12]
+Mod <- glm(Status~., family = "binomial", data = train.data.PCA)
+
+PCATest <- prcomp(TESTPCA, scale = FALSE, center= FALSE)
+TESTPCA <- merge(TESTPCA,Balanced_Data$Status, by = 0)
+colnames(TESTPCA)[14] <- "Status"
+TESTPCA[1] = NULL
+test.data.PCA <- data.frame(Status = TESTPCA$Status, PCATest$x)
+test.data.PCA <- test.data.PCA[,1:12]
+
+prediction <- predict(Mod, test.data.PCA)
+RocVal <- roc(test.data.PCA$Status,prediction)
+  AUCValue<- auc(RocVal)
+  AUCValue
+```
+
+```{r}
+#Logistic Regression using optimal Percentage Split
+set.seed(100)
+smp_size <- floor(0.75 * nrow(Balanced_Data))
+train_ind <- sample(seq_len(nrow(Balanced_DataLOG)), size = smp_size)
+train <- Balanced_DataLOG[train_ind, ]
+test <- Balanced_DataLOG[-train_ind, ]
+Mod <- glm(Status ~ Pledged + Backers + Updates + Comments + Pledge_per_person, family = "binomial", data = train)
+predPercSplit <- predict(Mod,test, type = "response")
+auc(roc(test$Status,predPercSplit)) #0.922 roc and auc give different auc vals?
+#14 fold cv is better and so we will use this. 
+
+
+#***** I see that a logistic regression with the features from the info gain with 21/30 folds for the test set is most optimal as it gives me highest AUC. *****
+```
+
+```{r}
+#KNN
+
+
+#___________________________________________________________________________
+#Standardize
+Balanced_DataKNN <- Balanced_Data %>% mutate_if(is.numeric, scale)
+Balanced_DataKNN <- Balanced_Data[,c(5,numericAtt)]
+Balanced_DataKNN$Status <- as.numeric(Balanced_DataKNN$Status) #converted successful and failed to 1 and 2
+Balanced_DataKNN <- Balanced_DataKNN[sample(1:nrow(Balanced_Data)), ]
+
+for (i in seq(.1,1,.1)) {
+
+  index = createDataPartition(Balanced_DataKNN$Status, p = i, list = F )
+  train = Balanced_DataKNN[index,]
+  test = Balanced_DataKNN[-index,]
+  Balanced_Train_labels <- Balanced_DataKNN[1:nrow(train),1]
+  Balanced_Test_labels <- Balanced_DataKNN[(nrow(train)+1):nrow(Balanced_DataKNN),1]
+  
+  KnnPredictions <- knn(train = train, test = test,cl = Balanced_Train_labels, k=10)
+
+}
+```
+
